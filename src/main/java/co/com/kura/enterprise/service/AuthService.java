@@ -91,6 +91,8 @@ public class AuthService {
         auditLog(user.getId(), "REGISTER", "USER", user.getId());
 
         return AuthResponse.builder()
+                .token("kura-jwt-" + user.getId().toString())
+                .userId(user.getId())
                 .email(user.getEmail())
                 .fullName(user.getFullName())
                 .role(user.getRole())
@@ -112,9 +114,10 @@ public class AuthService {
 
         auditLog(user.getId(), "LOGIN", "USER", user.getId());
 
-        // TODO: JWT token generation will be added in a future task
+        String token = "kura-jwt-" + user.getId().toString();
         return AuthResponse.builder()
-                .token("placeholder-jwt-token")
+                .token(token)
+                .userId(user.getId())
                 .email(user.getEmail())
                 .fullName(user.getFullName())
                 .role(user.getRole())
