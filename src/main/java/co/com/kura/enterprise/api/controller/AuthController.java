@@ -3,6 +3,7 @@ package co.com.kura.enterprise.api.controller;
 import co.com.kura.enterprise.api.dto.*;
 import co.com.kura.enterprise.service.AuthService;
 import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +17,12 @@ import java.util.Map;
 public class AuthController {
 
     private final AuthService authService;
+
+    @Value("${kura.cookie.domain:localhost}")
+    private String cookieDomain;
+
+    @Value("${kura.cookie.secure:false}")
+    private boolean cookieSecure;
 
     public AuthController(AuthService authService) {
         this.authService = authService;
@@ -45,19 +52,8 @@ public class AuthController {
     @PostMapping("/register")
     public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request) {
         AuthResponse response = authService.register(request);
-        
-        ResponseCookie cookie = ResponseCookie.from("KURA_SESSION", response.getToken())
-                .httpOnly(true)
-                .secure(true)
-                .domain(".kura.com.co")
-                .path("/")
-                .sameSite("Lax")
-                .maxAge(Duration.ofHours(24))
-                .build();
-        
-        // Remove token from response body (cookie-only)
+        ResponseCookie cookie = buildSessionCookie(response.getToken());
         response.setToken(null);
-        
         return ResponseEntity.ok()
                 .header(HttpHeaders.SET_COOKIE, cookie.toString())
                 .body(response);
@@ -66,19 +62,8 @@ public class AuthController {
     @PostMapping("/login")
     public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest request) {
         AuthResponse response = authService.login(request);
-        
-        ResponseCookie cookie = ResponseCookie.from("KURA_SESSION", response.getToken())
-                .httpOnly(true)
-                .secure(true)
-                .domain(".kura.com.co")
-                .path("/")
-                .sameSite("Lax")
-                .maxAge(Duration.ofHours(24))
-                .build();
-        
-        // Remove token from response body (cookie-only)
+        ResponseCookie cookie = buildSessionCookie(response.getToken());
         response.setToken(null);
-        
         return ResponseEntity.ok()
                 .header(HttpHeaders.SET_COOKIE, cookie.toString())
                 .body(response);
@@ -94,5 +79,16 @@ public class AuthController {
     public ResponseEntity<Map<String, String>> confirmReset(@Valid @RequestBody PasswordResetConfirm request) {
         authService.confirmPasswordReset(request);
         return ResponseEntity.ok(Map.of("message", "Password reset successful"));
+    }
+
+    private ResponseCookie buildSessionCookie(String token) {
+        return ResponseCookie.from("KURA_SESSION", token)
+                .httpOnly(true)
+                .secure(cookieSecure)
+                .domain(cookieDomain)
+                .path("/")
+                .sameSite("Lax")
+                .maxAge(Duration.ofHours(24))
+                .build();
     }
 }
