@@ -42,16 +42,21 @@
                     │                   │                   │
            ┌────────▼────────┐  ┌───────▼───────┐  ┌──────▼──────┐
            │ kura-enterprise  │  │  kura-b2c-api │  │    Redis    │
-           │   -api :8080     │  │     :8081     │  │  OTP/Reset  │
-           │ (Lab/Admin)      │  │ (Patient)     │  │   tokens    │
-           └────────▲────────┘  └───────▲───────┘  └─────────────┘
-                    │                   │
-           ┌────────┴────────┐  ┌───────┴───────┐
+           │   -api :8080     │  │     :8081     │  │  OTP/Reset/ │
+           │ Auth + Orders +  │  │ Search + Share│  │  Cache      │
+           │ Catalog + Results│  │ (Read-Only)   │  └─────────────┘
+           └────────▲────────┘  └───────▲───────┘
+                    │ ╲                 │
+           ┌────────┴──╲─────┐  ┌───────┴───────┐
            │ kura-workspace  │  │  kura-b2c-web │
            │   -web :4201    │  │     :4200     │
            │ (Angular 20)    │  │ (Angular 20)  │
            │ Lab Backoffice  │  │ Patient Portal│
            └─────────────────┘  └───────────────┘
+
+Note: kura-b2c-web calls BOTH APIs:
+  → Enterprise API (8080) for auth + orders
+  → B2C API (8081) for search + share
 ```
 
 ### 1.2 Repository Map
@@ -59,7 +64,7 @@
 | Repository | Purpose | Tech | Port |
 |-----------|---------|------|------|
 | **`kura-enterprise-api`** | Lab admin, backoffice, B2B marketplace API. Owns Flyway migrations. | Spring Boot 4.0 / Java 25 | 8080 |
-| **`kura-b2c-api`** | Patient-facing commerce API (search, orders, auth, share). | Spring Boot 4.0 / Java 25 | 8081 |
+| **`kura-b2c-api`** | Patient-facing read-only API: catalog search (pg_trgm), PoS listing, share links. No auth or orders (owned by Enterprise API). | Spring Boot 4.0 / Java 25 | 8081 |
 | **`kura-b2c-web`** | Patient portal: search exams, checkout, orders, share results. | Angular 20 / Tailwind 4 | 4200 |
 | **`kura-workspace-web`** | Lab backoffice: dashboard, catalog CRUD, orders, results, CSV import, inventory. | Angular 20 / Tailwind 4 | 4201 |
 
@@ -215,30 +220,21 @@ Master_Services (Composite Pattern: SINGLE | BUNDLE)
 
 ## 4. Backend: kura-b2c-api
 
+> **Scope**: Read-only catalog search and share links only. Auth and Orders are handled by the Enterprise API to avoid code duplication.
+
 ### 4.1 Architecture
 
 | Layer | Count | Details |
 |-------|-------|---------|
-| Controllers | 5 | Auth, Commerce, Search, Share, Health |
-| Services | 4 | AuthService, OrderService, SearchService, ShareService |
-| Entities | 11 | Subset of domain model (no Lab, Inventory, TestDependency, AuditLog) |
-| Repositories | 11 | Spring Data JPA |
-| DTOs | 14 | Request + Response objects |
-| Infrastructure | 6 | 3 interfaces + 3 mock implementations |
+| Controllers | 3 | Search, Share, Health |
+| Services | 2 | SearchService (JdbcTemplate + `@Cacheable`), ShareService (JdbcTemplate + JPA) |
+| Entities | 6 | MasterService, LabOffering, BundleItem, PointOfService, PatientResult, ShareLink |
+| Repositories | 6 | Spring Data JPA (read-only access to shared DB) |
+| DTOs | 3 | SearchResponse, PosResponse, ShareResponse |
+| Infrastructure | 0 | No mock providers (all integrations owned by Enterprise API) |
 | Config | 4 | SecurityConfig, CorsConfig, CacheConfig, GlobalExceptionHandler |
 
 ### 4.2 API Endpoints
-
-#### Auth (`/api/v1/auth`) — AuthController
-
-| Method | Path | Description | Auth |
-|--------|------|-------------|------|
-| POST | `/otp/send` | Send OTP (Redis, 5min TTL) | Public |
-| POST | `/otp/verify` | Verify OTP | Public |
-| POST | `/register` | Register patient (RNEC mock + Ley 1581 + HttpOnly cookie) | Public |
-| POST | `/login` | Login (BCrypt + HttpOnly cookie) | Public |
-| POST | `/password/reset` | Request password reset | Public |
-| POST | `/password/reset/confirm` | Confirm reset | Public |
 
 #### Search (`/api/v1/search`) — SearchController
 
@@ -246,25 +242,27 @@ Master_Services (Composite Pattern: SINGLE | BUNDLE)
 |--------|------|-------------|------|
 | GET | `/services?q=&posId=&limit=` | pg_trgm fuzzy search with Redis `@Cacheable` | Public |
 | GET | `/services/{code}` | Get service detail by code | Public |
-
-#### Commerce (`/api/v1/orders`) — CommerceController
-
-| Method | Path | Description | Auth |
-|--------|------|-------------|------|
-| POST | `/` | Create order (guest or user, single-PoS cart + walk-in ticket + MercadoPago mock) | Public |
-| GET | `/{orderNumber}` | Get order by number | Public |
-| GET | `/user/{userId}` | User order history | Public |
+| GET | `/pos` | List active Points of Service (`@Cacheable`) | Public |
 
 #### Share (`/api/v1/share`) — ShareController
 
 | Method | Path | Description | Auth |
 |--------|------|-------------|------|
-| GET | `/{shareUuid}` | Access result via 48h share link | Public |
+| GET | `/{shareUuid}` | Access result via 48h share link (increments access count) | Public |
+
+#### Health (`/api/v1`) — HealthController
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| GET | `/ping` | Service health check | Public |
 
 ### 4.3 B2C-Specific Features
 
-- **Redis Caching** (`@EnableCaching` + `RedisCacheManager`): search results cached 15min via `@Cacheable`
+- **Redis Caching** (`@EnableCaching` + `RedisCacheManager`): search results cached 15min, PoS locations cached indefinitely via `@Cacheable`
+- **No PasswordEncoder bean** — authentication is not handled here
 - **Flyway disabled**: B2C does not run migrations; it validates against existing schema
+- **JdbcTemplate for search**: Uses raw SQL with `pg_trgm` `similarity()` for ranked fuzzy search
+- **ShareService uses JDBC for user lookup**: Patient name fetched via `JdbcTemplate` query (User entity is not mapped in B2C)
 - **Runs on port 8081** to coexist with enterprise-api on 8080
 
 ---
@@ -300,11 +298,23 @@ Master_Services (Composite Pattern: SINGLE | BUNDLE)
 
 | Service | Purpose |
 |---------|---------|
-| `ApiService` | HTTP client for all B2C API calls |
+| `ApiService` | HTTP client — routes to **two backends**: B2C API (search/share) + Enterprise API (auth/orders) |
 | `AuthService` | Auth state management (signals, localStorage) |
 | `CartService` | Shopping cart (signals, localStorage, single-PoS enforcement) |
 
-### 5.4 Design Language
+### 5.4 Dual-API Routing
+
+The B2C frontend calls two separate backend APIs:
+
+| Endpoint Group | Target API | Dev URL |
+|----------------|-----------|---------|
+| Search, PoS listing, Share | B2C API | `http://localhost:8081/api/v1` |
+| Auth (login, register, OTP, reset) | Enterprise API | `http://localhost:8080/api/v1` |
+| Orders (create, list, get) | Enterprise API | `http://localhost:8080/api/v1` |
+
+Configured via `environment.b2cApiUrl` and `environment.enterpriseApiUrl`.
+
+### 5.5 Design Language
 
 - **Primary**: Trust Medical Blue (`#0ea5e9`)
 - **Accent**: Emerald Green (`#10b981`)
@@ -375,9 +385,9 @@ Set-Cookie: KURA_SESSION=kura-jwt-{userId};
 | API | Public Endpoints | Default |
 |-----|------------------|---------|
 | Enterprise | `/api/v1/auth/**`, `/actuator/health,info` | All others require authentication |
-| B2C | `/api/v1/auth/**`, `/api/v1/search/**`, `/api/v1/orders/**`, `/api/v1/share/**`, `/actuator/health,info` | All others require authentication |
+| B2C | `/api/v1/search/**`, `/api/v1/share/**`, `/api/v1/health/**`, `/actuator/health,info` | All others require authentication |
 
-**Note**: No JWT filter is implemented yet — `authenticated()` endpoints will return 401 in MVP. This is by design; real JWT validation is Phase 2.
+**Note**: No JWT filter is implemented yet — `authenticated()` endpoints will return 401 in MVP. This is by design; real JWT validation is Phase 2. B2C API has no auth endpoints — all authentication flows through Enterprise API.
 
 ### 7.4 CORS
 
@@ -493,11 +503,7 @@ Both default to Spanish (Colombia) — `defaultLanguage: 'es'`.
 
 ### 11.2 B2C API Mocks
 
-| # | System | Interface | Mock Class | File | Default Behavior | Phase 2 |
-|---|--------|-----------|------------|------|------------------|---------|
-| 5 | AWS SES (Email) | `EmailProvider` | `MockSesEmailProvider` | `infrastructure/MockSesEmailProvider.java` | Logs to console | AWS SES SDK |
-| 6 | RNEC (Colombian ID) | `IdentityVerificationProvider` | `MockRnecProvider` | `infrastructure/MockRnecProvider.java` | Always returns `MATCH` | RNEC SOAP/REST |
-| 7 | MercadoPago | `PaymentProvider` | `MockMercadoPagoProvider` | `infrastructure/MockMercadoPagoProvider.java` | Fake external ID + sandbox URL | MercadoPago SDK (COP) |
+> **None.** All mock integrations were removed from `kura-b2c-api` during the API responsibility split. Auth, payments, email, and identity verification are exclusively owned by `kura-enterprise-api`.
 
 ### 11.3 Workspace Web Mocks
 
@@ -543,10 +549,11 @@ All mocked code contains: `// MOCK INTEGRATION: [System Name] - [Description]`
 
 ### 12.3 Frontend Environments
 
-| App | Dev API URL | Prod API URL |
-|-----|-------------|-------------|
-| B2C Web | `http://localhost:8081/api/v1` | `/api/v1` |
-| Workspace Web | `http://localhost:8080/api/v1` | `/api/v1` |
+| App | Variable | Dev URL | Prod URL |
+|-----|----------|---------|----------|
+| B2C Web | `b2cApiUrl` | `http://localhost:8081/api/v1` | `/b2c-api/v1` |
+| B2C Web | `enterpriseApiUrl` | `http://localhost:8080/api/v1` | `/api/v1` |
+| Workspace Web | `apiUrl` | `http://localhost:8080/api/v1` | `/api/v1` |
 
 ---
 
@@ -570,14 +577,14 @@ All mocked code contains: `// MOCK INTEGRATION: [System Name] - [Description]`
 
 | Metric | Count |
 |--------|-------|
-| Java source files | 34 |
-| JPA entities | 11 |
-| Repositories | 11 |
-| REST controllers | 5 |
-| REST endpoints | 11 |
-| DTOs | 14 |
-| Services | 4 |
-| Mock integrations | 3 |
+| Java source files | 16 |
+| JPA entities | 6 |
+| Repositories | 6 |
+| REST controllers | 3 |
+| REST endpoints | 4 |
+| DTOs | 3 |
+| Services | 2 |
+| Mock integrations | 0 |
 
 ### 13.3 B2C Web
 
@@ -610,20 +617,21 @@ All mocked code contains: `// MOCK INTEGRATION: [System Name] - [Description]`
 
 ## 14. Known Issues & Tech Debt
 
-### 14.1 Bugs Fixed (BUG-002, BUG-003)
+### 14.1 Bugs Fixed (BUG-001, BUG-002, BUG-003)
 
+- **BUG-001**: SSO cookie not being set with `HttpOnly; Secure; Domain=.kura.com.co`. Fixed in both APIs.
 - **BUG-002**: B2C API JPA entities had column names that didn't match the shared DB schema (9 entities, 20+ column mismatches). Fixed in `fix/entity-schema-alignment` branch.
 - **BUG-003**: Enterprise API `ResultService.deductInventory()` was looking up test dependencies using `orderItemId` (an OrderItem UUID) instead of the service ID. Fixed in `fix/entity-schema-alignment` branch.
 
-### 14.2 Previously Fixed
+### 14.2 Refactors Applied
 
-- **BUG-001**: SSO cookie not being set with `HttpOnly; Secure; Domain=.kura.com.co`. Fixed in both APIs.
+- **API Responsibility Split**: Removed duplicated Auth and Orders code from B2C API. Enterprise API is the single owner. B2C API is now a lightweight read-only search/share service. B2C frontend calls both APIs via dual base URLs.
 
 ### 14.3 Remaining Tech Debt
 
 | # | Issue | Severity | Location | Notes |
 |---|-------|----------|----------|-------|
-| 1 | No JWT filter — authenticated endpoints always 401 | Medium | Both APIs `SecurityConfig` | Phase 2: implement JWT validation filter |
+| 1 | No JWT filter — authenticated endpoints always 401 | Medium | Enterprise API `SecurityConfig` | Phase 2: implement JWT validation filter |
 | 2 | B2C `SearchService` accepts `posId` param but doesn't filter by it in SQL | Low | `kura-b2c-api/SearchService.java` | Should JOIN `lab_offerings` by `posId` |
 | 3 | Workspace `TranslateHttpLoader` factory doesn't inject `HttpClient` | Low | `kura-workspace-web/app.config.ts` | Translation loading may silently fail |
 | 4 | Workspace pages use hardcoded data (14 mock points) | Expected | `kura-workspace-web/pages/*` | Wire to real enterprise API in Phase 2 |
@@ -631,7 +639,7 @@ All mocked code contains: `// MOCK INTEGRATION: [System Name] - [Description]`
 | 6 | B2C `api.models.ts` interfaces don't match actual API DTOs | Low | `kura-b2c-web/models/api.models.ts` | Frontend uses different shape than backend returns |
 | 7 | `AppComponent` exported name vs spec import mismatch | Low | Both web apps `app.spec.ts` | Spec expects `App`, class exports `AppComponent` |
 | 8 | No `@Cacheable` in enterprise-api catalog | Low | `kura-enterprise-api/CatalogService.java` | Add Redis caching like B2C has |
-| 9 | Password reset TTL differs: Enterprise 1hr, B2C 30min | Low | Both `AuthService` | Standardize |
+| 9 | Enterprise API CORS must allow B2C frontend origin | Medium | `kura-enterprise-api/CorsConfig.java` | B2C Web now calls Enterprise API directly — needs `http://localhost:4200` in allowed origins |
 
 ---
 
