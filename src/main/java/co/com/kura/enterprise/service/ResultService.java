@@ -25,6 +25,7 @@ public class ResultService {
     private final TestDependencyRepository testDependencyRepository;
     private final WarehouseInventoryRepository inventoryRepository;
     private final OrderRepository orderRepository;
+    private final OrderItemRepository orderItemRepository;
     private final StorageProvider storageProvider;
 
     public ResultService(PatientResultRepository resultRepository,
@@ -32,12 +33,14 @@ public class ResultService {
                          TestDependencyRepository testDependencyRepository,
                          WarehouseInventoryRepository inventoryRepository,
                          OrderRepository orderRepository,
+                         OrderItemRepository orderItemRepository,
                          StorageProvider storageProvider) {
         this.resultRepository = resultRepository;
         this.shareLinkRepository = shareLinkRepository;
         this.testDependencyRepository = testDependencyRepository;
         this.inventoryRepository = inventoryRepository;
         this.orderRepository = orderRepository;
+        this.orderItemRepository = orderItemRepository;
         this.storageProvider = storageProvider;
     }
 
@@ -123,9 +126,9 @@ public class ResultService {
 
     private void deductInventory(PatientResult result) {
         if (result.getOrderItemId() == null) return;
-
-        // Find the service's BOM (test dependencies)
-        List<TestDependency> deps = testDependencyRepository.findByServiceId(result.getOrderItemId());
+        OrderItem orderItem = orderItemRepository.findById(result.getOrderItemId()).orElse(null);
+        if (orderItem == null) return;
+        List<TestDependency> deps = testDependencyRepository.findByServiceId(orderItem.getServiceId());
 
         for (TestDependency dep : deps) {
             inventoryRepository.findByPosIdAndItemCode(result.getPosId(), dep.getItemCode())
